@@ -1,0 +1,370 @@
+import os
+import json
+import uuid
+import boto3
+import time
+from botocore.exceptions import ClientError
+from PIL import Image, ImageDraw, ImageFont
+
+# Configuration
+processed_bucket = os.environ['processed_bucket']
+metadata_table = os.environ.get('METADATA_TABLE', 'ImageProcessingMetadata')
+comparison_bucket = os.environ.get('COMPARISON_BUCKET', processed_bucket)
+sns_topic_arn = os.environ['SNS_TOPIC_ARN']  # New environment variable
+
+# AWS Clients
+s3_client = boto3.client('s3')
+dynamodb = boto3.resource('dynamodb')
+sns_client = boto3.client('sns')  # New SNS client
+table = dynamodb.Table(metadata_table)
+
+# Watermark settings
+WATERMARK_TEXT = os.getenv('WATERMARK_TEXT', 'Aasritha vathsala')
+WATERMARK_FONT_SIZE = int(os.getenv('WATERMARK_FONT_SIZE', '24'))
+WATERMARK_OPACITY = int(os.getenv('WATERMARK_OPACITY', '128'))
+WATERMARK_POSITION = os.getenv('WATERMARK_POSITION', 'bottom-right')
+
+def pixelate(pixelsize, image_path, pixelated_img_path):
+    """Pixelate an image to the specified pixelsize"""
+    img = Image.open(image_path)
+    temp_img = img.resize(pixelsize, Image.BILINEAR)
+    new_img = temp_img.resize(img.size, Image.NEAREST)
+    new_img.save(pixelated_img_path)
+
+def add_watermark(input_path, output_path, text, font_size=24, opacity=128, position='bottom-right'):
+    """Adds a watermark to an image"""
+    try:
+        base_image = Image.open(input_path).convert("RGBA")
+        width, height = base_image.size
+        
+        txt_layer = Image.new("RGBA", base_image.size, (255, 255, 255, 0))
+        
+        try:
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+        
+        d = ImageDraw.Draw(txt_layer)
+        text_width, text_height = d.textsize(text, font=font)
+        
+        if position == 'center':
+            pos = ((width - text_width) // 2, (height - text_height) // 2)
+        elif position == 'bottom-right':
+            pos = (width - text_width - 10, height - text_height - 10)
+        elif position == 'top-left':
+            pos = (10, 10)
+        else:
+            pos = (10, 10)
+        
+        d.text(pos, text, font=font, fill=(255, 255, 255, opacity))
+        watermarked = Image.alpha_composite(base_image, txt_layer)
+        
+        if not output_path.lower().endswith('.png'):
+            watermarked = watermarked.convert("RGB")
+        watermarked.save(output_path)
+        
+    except Exception as e:
+        print(f"Error adding watermark: {str(e)}")
+        raise
+
+def create_comparison_image(original_path, processed_path, output_path, level):
+    """Creates a side-by-side comparison image"""
+    original = Image.open(original_path)
+    processed = Image.open(processed_path)
+    
+    # Resize to same height if needed
+    if original.size[1] != processed.size[1]:
+        new_height = min(original.size[1], processed.size[1])
+        original = original.resize(
+            (int(original.size[0] * (new_height / original.size[1])), new_height)
+        )
+        processed = processed.resize(
+            (int(processed.size[0] * (new_height / processed.size[1])), new_height)
+        )
+    
+    # Create new image with combined width
+    total_width = original.size[0] + processed.size[0]
+    comparison = Image.new('RGB', (total_width, original.size[1]))
+    
+    # Paste images side by side
+    comparison.paste(original, (0, 0))
+    comparison.paste(processed, (original.size[0], 0))
+    
+    # Add labels
+    draw = ImageDraw.Draw(comparison)
+    try:
+        font = ImageFont.truetype("arial.ttf", 24)
+    except:
+        font = ImageFont.load_default()
+    
+    draw.text((10, 10), "Original", fill="white", font=font)
+    draw.text((original.size[0] + 10, 10), f"Pixelated {level[0]}x{level[1]}", fill="white", font=font)
+    
+    comparison.save(output_path)
+
+def create_html_viewer(original_key, processed_key, output_path, level):
+    """Creates an interactive HTML comparison viewer"""
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Image Comparison - {level[0]}x{level[1]}</title>
+        <style>
+            .comparison-container {{
+                width: 100%;
+                max-width: 800px;
+                margin: 20px auto;
+                position: relative;
+            }}
+            .image-wrapper {{
+                position: relative;
+                overflow: hidden;
+                width: 100%;
+                height: auto;
+            }}
+            .image {{
+                display: block;
+                width: 100%;
+                height: auto;
+            }}
+            .slider {{
+                position: absolute;
+                top: 0;
+                bottom: 0;
+                width: 4px;
+                background: white;
+                left: 50%;
+                transform: translateX(-50%);
+                cursor: ew-resize;
+                z-index: 10;
+            }}
+            .slider:before {{
+                content: "↔";
+                position: absolute;
+                left: -15px;
+                top: 50%;
+                transform: translateY(-50%);
+                background: white;
+                padding: 5px;
+                border-radius: 50%;
+                font-size: 20px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="comparison-container">
+            <div class="image-wrapper" id="comparison">
+                <img src="https://{processed_bucket}.s3.amazonaws.com/{original_key}" 
+                     alt="Original" id="original" class="image">
+                <div class="slider" id="slider"></div>
+                <img src="https://{processed_bucket}.s3.amazonaws.com/{processed_key}" 
+                     alt="Processed" id="processed" class="image" style="position: absolute; top: 0; left: 0; width: 50%; height: 100%; object-fit: cover;">
+            </div>
+        </div>
+        
+        <script>
+            const slider = document.getElementById('slider');
+            const processedImg = document.getElementById('processed');
+            const container = document.getElementById('comparison');
+            let isDragging = false;
+            
+            slider.addEventListener('mousedown', () => isDragging = true);
+            document.addEventListener('mouseup', () => isDragging = false);
+            document.addEventListener('mousemove', (e) => {{
+                if (!isDragging) return;
+                
+                const containerRect = container.getBoundingClientRect();
+                const x = e.clientX - containerRect.left;
+                const percentPosition = Math.min(1, Math.max(0, x / containerRect.width));
+                
+                processedImg.style.width = `${(1 - percentPosition) * 100}%`;
+                slider.style.left = `${percentPosition * 100}%`;
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    
+    with open(output_path, 'w') as f:
+        f.write(html_content)
+def send_notification(key, comparison_results):
+    """Send SNS notification with processing results"""
+    try:
+        # Create message with all comparison links
+        comparison_links = "\n".join(
+            [f"- {res['level']}: {res['viewer'].replace('s3://', 'https://')}" 
+             for res in comparison_results if 'viewer' in res]
+        )
+        
+        message = f"""
+        Your image {key} has been processed successfully!
+        
+        Access your pixelated versions:
+        {comparison_links}
+        
+        Thank you for using our service!
+        """
+        
+        sns_client.publish(
+            TopicArn=sns_topic_arn,
+            Message=message,
+            Subject=f"Image Processing Complete: {key}"
+        )
+        print("Notification sent successfully")
+    except Exception as e:
+        print(f"Error sending notification: {str(e)}")
+
+def lambda_handler(event, context):
+    print(event)
+    
+    # Get source details
+    source_bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+    object_key = str(uuid.uuid4()) + '-' + key
+    img_download_path = '/tmp/{}'.format(object_key)
+    
+    # Get original image metadata
+    try:
+        head_object = s3_client.head_object(Bucket=source_bucket, Key=key)
+        original_metadata = head_object.get('Metadata', {})
+        content_type = head_object.get('ContentType', 'unknown')
+        file_size = head_object.get('ContentLength', 0)
+    except ClientError as e:
+        print(f"Error getting object metadata: {str(e)}")
+        return {'statusCode': 404, 'body': json.dumps(f"Object not found: {str(e)}")}
+
+    # Download the source image
+    try:
+        s3_client.download_file(source_bucket, key, img_download_path)
+    except ClientError as e:
+        print(f"Error downloading file: {str(e)}")
+        return {'statusCode': 500, 'body': json.dumps(f"Error downloading file: {str(e)}")}
+
+    # Process images
+    pixel_levels = [(8, 8), (16, 16), (32, 32), (48, 48), (64, 64)]
+    processing_results = []
+    comparison_results = []
+    timestamp = int(time.time())
+    
+    for level in pixel_levels:
+        try:
+            processing_id = str(uuid.uuid4())
+            
+            # Pixelate
+            pixelated_path = f'/tmp/pixelated-{level[0]}x{level[1]}-{object_key}'
+            pixelate(level, img_download_path, pixelated_path)
+            
+            # Add watermark
+            watermarked_path = f'/tmp/watermarked-{level[0]}x{level[1]}-{object_key}'
+            add_watermark(
+                pixelated_path, 
+                watermarked_path,
+                text=WATERMARK_TEXT,
+                font_size=WATERMARK_FONT_SIZE,
+                opacity=WATERMARK_OPACITY,
+                position=WATERMARK_POSITION
+            )
+            
+            # Upload processed image
+            output_key = f'pixelated-{level[0]}x{level[1]}-{key}'
+            s3_client.upload_file(watermarked_path, processed_bucket, output_key)
+            
+            # Create comparison image
+            comparison_path = f'/tmp/comparison-{level[0]}x{level[1]}-{object_key}.jpg'
+            create_comparison_image(
+                original_path=img_download_path,
+                processed_path=watermarked_path,
+                output_path=comparison_path,
+                level=level
+            )
+            
+            # Upload comparison image
+            comparison_key = f'comparisons/comparison-{level[0]}x{level[1]}-{key}'
+            s3_client.upload_file(
+                comparison_path,
+                comparison_bucket,
+                comparison_key,
+                ExtraArgs={'ContentType': 'image/jpeg'}
+            )
+            
+            # Create HTML viewer
+            html_path = f'/tmp/viewer-{level[0]}x{level[1]}-{object_key}.html'
+            create_html_viewer(
+                original_key=key,
+                processed_key=output_key,
+                output_path=html_path,
+                level=level
+            )
+            
+            # Upload HTML viewer
+            html_key = f'comparisons/viewer-{level[0]}x{level[1]}-{key.split(".")[0]}.html'
+            s3_client.upload_file(
+                html_path,
+                comparison_bucket,
+                html_key,
+                ExtraArgs={'ContentType': 'text/html'}
+            )
+            
+            # Record results
+            processing_results.append({
+                'processingId': processing_id,
+                'pixelationLevel': f"{level[0]}x{level[1]}",
+                'outputKey': output_key,
+                'status': 'success'
+            })
+            
+            comparison_results.append({
+                'level': f"{level[0]}x{level[1]}",
+                'comparisonImage': f"s3://{comparison_bucket}/{comparison_key}",
+                'viewer': f"s3://{comparison_bucket}/{html_key}"
+            })
+            
+        except Exception as e:
+            print(f"Error processing level {level}: {str(e)}")
+            processing_results.append({
+                'processingId': str(uuid.uuid4()),
+                'pixelationLevel': f"{level[0]}x{level[1]}",
+                'status': 'failed',
+                'error': str(e)
+            })
+            continue
+
+    # Store complete processing record in DynamoDB
+    try:
+        record = {
+            'imageId': key,
+            'processingTimestamp': timestamp,
+            'originalBucket': source_bucket,
+            'originalKey': key,
+            'originalMetadata': original_metadata,
+            'contentType': content_type,
+            'fileSize': file_size,
+            'processedBucket': processed_bucket,
+            'processingResults': processing_results,
+            'comparisonResults': comparison_results,
+            'watermarkSettings': {
+                'text': WATERMARK_TEXT,
+                'fontSize': WATERMARK_FONT_SIZE,
+                'opacity': WATERMARK_OPACITY,
+                'position': WATERMARK_POSITION
+            },
+            'lambdaRequestId': context.aws_request_id
+        }
+        
+        table.put_item(Item=record)
+        
+    except Exception as e:
+        print(f"Error saving metadata to DynamoDB: {str(e)}")
+
+    # Send SNS notification if at least one processing succeeded
+    if any(res['status'] == 'success' for res in processing_results):
+        send_notification(key, comparison_results)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Processing complete',
+            'metadataRecordId': f"{key}-{timestamp}",
+            'comparisons': comparison_results
+        })
+    }
